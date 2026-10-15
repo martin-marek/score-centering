@@ -96,6 +96,32 @@ def take_vocab(logp, ids):
     return logp.at[b, c, ids].get(out_sharding=P(*spec[:-1], None))
 
 
+def loss_fn_drift(hidden, head, batch, chunk=128):
+    """Surrogate whose parameter gradient is the token-mean expected score.
+
+    Uses the unweighted sampler's transported top-k head + rho*p tail, with
+    the same tail clipping and denominator floor as loss_fn_rl. The detached
+    residual uses sum_v p(v) * grad log p(v) = 0 to account for the tail.
+    Differentiate through both hidden and head to measure parameter drift;
+    take the norm only after averaging the score vectors over live tokens.
+    """
+    mask = jnp.roll(batch["mask"], -1, axis=1).at[:, -1].set(False)
+    seq_len = mask.shape[1]
+    chunk = next(n for n in range(min(chunk, seq_len), 0, -1) if seq_len % n == 0)
+
+    def chunk_sum(start):
+        slc = lambda x: jax.lax.dynamic_slice_in_dim(x, start, chunk, axis=1)
+        logp = jax.nn.log_softmax(head(slc(hidden)).astype(jnp.float32))
+        logp_head = take_vocab(logp, slc(batch["center_ids"]))
+        p_head, q_head = jnp.exp(logp_head), jnp.exp(slc(batch["center_logprobs"]))
+        rho = jnp.maximum(1.0 - q_head.sum(-1), 0.0) / jnp.maximum(1.0 - p_head.sum(-1), 1e-6)
+        surrogate = (sg(q_head - rho[..., None] * p_head) * logp_head).sum(-1)
+        return (surrogate * slc(mask)).sum()
+
+    chunks = jax.lax.map(jax.checkpoint(chunk_sum), jnp.arange(0, seq_len, chunk))
+    return chunks.sum() / jnp.maximum(mask.sum(), 1)
+
+
 def loss_fn_rl(hidden, head, batch, correction=None, score_center=False, chunk=128):
     """REINFORCE loss on sampled rollouts, with an optional ISCorrection and
     score centering. Returns (loss, metrics).
