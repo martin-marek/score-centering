@@ -8,7 +8,23 @@ Score centering stabilizes RL under training-inference mismatch (TIM) by canceli
 
 ![Score centering under progressively stronger sampler quantization.](assets/30b_math.png)
 
-## Score Centering: loss function
+## Using Score Centering
+
+Score centering has now been implemented in most major RL frameworks:
+
+- [verl](https://verl.readthedocs.io/en/latest/algo/rollout_corr.html#score-centering-bool)
+- [TRL](https://huggingface.co/docs/trl/main/en/async_grpo_trainer) (`AsyncGRPOTrainer` default)
+- [slime](https://thudm.github.io/slime/get_started/usage.html#score-centering)
+- [Miles](https://miles.radixark.com/docs/examples/infra-features/score-centering#score-centering)
+- [prime-rl](https://x.com/samsja19/status/2114262782602592619) (upcoming default)
+- [Molt](https://github.com/NVIDIA-NeMo/labs-molt)
+- [SkyRL](https://github.com/NovaSky-AI/SkyRL/pull/2244)
+- [Vime](https://github.com/vllm-project/vime/pull/441)
+- [Tinker](https://x.com/mrtnm/status/2114145574987702525)
+
+This repository's primary function is to provide a reference implementation and to enable the reproducibility of the experiments from the paper.
+
+## Loss function
 
 We store the sampler's top-k logprobs (k=128) and model the tail with the trainer's distribution, rescaled to match the sampler's tail mass.
 
@@ -95,7 +111,7 @@ loss = (token_loss * mask).sum() / mask.sum().clamp_min(1)
 
 Full training implementation: [`losses.py`](losses.py).
 
-## Corrections in the trainer
+## Importance Sampling
 
 In [`losses.py`](losses.py) every off-policy correction is REINFORCE with a detached weight w(p/q). Each method is one point on a single `rl.is.*` grid:
 - `level`: the weight is per token or per sequence;
