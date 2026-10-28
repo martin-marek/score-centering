@@ -7,11 +7,13 @@ import wandb
 from omegaconf import OmegaConf
 
 
-def parse_cfg(default_cfg):
-    """YAML defaults overridden by key=value command-line arguments."""
+def parse_cfg(default_cfg, validate=None):
+    """YAML defaults overridden by key=value arguments, validated before W&B."""
     cfg = OmegaConf.create(default_cfg)
     OmegaConf.set_struct(cfg, True)  # unknown keys are errors
     cfg = OmegaConf.merge(cfg, OmegaConf.from_cli())
+    if validate is not None:
+        validate(cfg)
     if jax.process_index() == 0:
         wandb.init(project=cfg.log.project, mode=cfg.log.wandb_mode, name=cfg.log.run_name,
                    config=OmegaConf.to_container(cfg, resolve=True))

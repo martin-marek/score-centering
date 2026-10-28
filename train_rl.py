@@ -43,6 +43,7 @@ rl:
   seq_len: 1024
   reward_mode: group_centered  # plus_minus | plus_zero | zero_minus | group_centered
   sc: false  # score centering
+  log_drift_every: 0  # off; K>0: log ||E_q[grad log p]|| at step % K == 0 (including 0)
   is:  # IS correction; named methods are points on this grid (table in README.md)
     level: null    # null (off) | token | seq_mean | seq_sum
     stat: ratio    # ratio | tv
@@ -82,7 +83,27 @@ def fixed_weight_delta(weights, key, scale):
     return jax.tree.unflatten(structure, deltas)
 
 
+def check_drift_config(cfg):
+    every = cfg.rl.log_drift_every
+    if type(every) is not int or every < 0:
+        raise ValueError("rl.log_drift_every must be 0 (off) or a positive integer")
+    if every and (type(cfg.sampler.vocab_logprobs) is not int or cfg.sampler.vocab_logprobs <= 0):
+        raise ValueError("rl.log_drift_every requires a positive integer top-k sampler.vocab_logprobs (not null or full)")
+
+
+def drift_norm(model, weights, batch, chunk=128):
+    """Norm of the mean unweighted sampler score, through forward and head."""
+    def objective(weights):
+        hidden = model.forward(batch["tokens"], weights, dtype=jnp.bfloat16, logits=False,
+                               live=batch["tokens"] != model.tokenizer.pad_token_id)
+        head = lambda x: model.head(x, weights, dtype=jnp.bfloat16)
+        return losses.loss_fn_drift(hidden, head, batch, chunk)
+
+    return optax.global_norm(jax.grad(objective)(weights))
+
+
 def train(cfg):
+    check_drift_config(cfg)
     key = jax.random.key(cfg.run.seed)
     model = models.load(cfg.model.source, cfg.model.weights_dir)
     model.weights = jax.tree.map(lambda w: w.astype(jnp.float32), model.weights)  # fp32 masters
@@ -163,6 +184,8 @@ def train(cfg):
             sample(eval_rows[i:i + num_prompts], weights, jax.random.fold_in(eval_key, i), eval_forward)[2]
             for i in range(0, len(eval_rows), num_prompts)])
 
+    drift_norm_fn = jax.jit(partial(drift_norm, model)) if cfg.rl.log_drift_every else None
+
     @partial(jax.jit, donate_argnums=(0, 1))
     def optimize(weights, opt_state, batch):
         def objective(weights):
@@ -198,6 +221,9 @@ def train(cfg):
             # and collective scratch of this [B, T, V] array set the memory peak.
             batch["sampling_vocab_logprobs"] = reshard(vocab, NamedSharding(trainer_mesh, P("data", None, "model")))
             del vocab
+        if drift_norm_fn is not None and step % cfg.rl.log_drift_every == 0:
+            # Finish reading pre-update weights before optimize donates them.
+            metrics["drift_norm"] = jax.block_until_ready(drift_norm_fn(model.weights, batch))
         model.weights, opt_state, opt_metrics = optimize(model.weights, opt_state, batch)
         del batch
 
@@ -220,4 +246,4 @@ if __name__ == "__main__":
     # Spawn, never fork: forked scorer workers would inherit this threaded CUDA process.
     import multiprocessing
     multiprocessing.set_start_method("spawn", force=True)
-    train(utils.parse_cfg(DEFAULT_CFG))
+    train(utils.parse_cfg(DEFAULT_CFG, validate=check_drift_config))
